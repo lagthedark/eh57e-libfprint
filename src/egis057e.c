@@ -100,11 +100,13 @@
  * total deadline. Kept below the genuine near-miss floor so a plausible press
  * in [REJECT_SCORE, MATCH_THRESHOLD) still keeps collecting. */
 #define EGIS057E_VERIFY_REJECT_SCORE        800
-/* Same-spot reject gate. Raised from the EH575-inherited 650: the EH57E
- * matcher score scale is ~2-3x higher (genuine cross-press ~800-4000), so 650
- * fired on normal different-placement enrollment frames. Env-tunable via
- * EGIS057E_ENROLL_SIM_THRESHOLD (0 disables). PRELIMINARY value. */
-#define EGIS057E_ENROLL_SIM_THRESHOLD       3000
+/* Same-spot reject gate. DEFAULT DISABLED (0): the EH57E matcher score scale is
+ * ~2-3x the vendor's, so any positive threshold fired on normal different-
+ * placement enrollment frames and looped up to EGIS057E_ENROLL_SIM_MAX_REJECTS
+ * retries per stage (looks like a hang in GNOME). This is a PRELIMINARY gate;
+ * re-enable/tune without a rebuild via the env override
+ * EGIS057E_ENROLL_SIM_THRESHOLD (0 disables). */
+#define EGIS057E_ENROLL_SIM_THRESHOLD       0
 #define EGIS057E_ENROLL_SIM_MAX_REJECTS     4
 
 /* -------------------------------------------------------------------------
@@ -145,6 +147,7 @@ struct _FpDeviceEgis057e
   gboolean    touch_pending;
   double      touch_best_quality;
   Egis057eImageQuality touch_best_q;
+  gboolean    retry_reported;   /* one-shot weak-press retry per touch */
   guint8      calibration_sample;
   gboolean    have_calibration_sample;
 
@@ -291,6 +294,35 @@ egis057e_log_bytes (const char *prefix, const guint8 *buf, gsize len)
 }
 
 /* -------------------------------------------------------------------------
+ * Finger-status reporting (delta-only, like egis0575)
+ *
+ * Proven pure-FpDevice drivers never call the bare
+ * fpi_device_report_finger_status(), which REPLACES the whole flag set and can
+ * wipe PRESENT; they always apply deltas via
+ * fpi_device_report_finger_status_changes(). These helpers keep PRESENT and
+ * NEEDED independent: report_needed() starts an action wanting a finger while
+ * clearing any stale PRESENT; report_present() only toggles PRESENT and leaves
+ * NEEDED as-is.
+ * ------------------------------------------------------------------------- */
+
+static void
+egis057e_report_present (FpDevice *dev, gboolean present)
+{
+  /* Delta-style, like egis0575: toggles PRESENT, leaves NEEDED as-is. */
+  fpi_device_report_finger_status_changes (dev,
+    present ? FP_FINGER_STATUS_PRESENT : FP_FINGER_STATUS_NONE,
+    present ? FP_FINGER_STATUS_NONE    : FP_FINGER_STATUS_PRESENT);
+}
+
+static void
+egis057e_report_needed (FpDevice *dev)
+{
+  /* Action start: waiting for a finger; clear any stale PRESENT. */
+  fpi_device_report_finger_status_changes (dev,
+    FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_PRESENT);
+}
+
+/* -------------------------------------------------------------------------
  * USB transport helpers (EGIS / SIGE framing)
  * ------------------------------------------------------------------------- */
 
@@ -332,7 +364,7 @@ int_finger_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   egis057e_log_bytes ("interrupt payload: ", transfer->buffer,
                       transfer->actual_length);
-  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
+  egis057e_report_present (dev, TRUE);
   fpi_ssm_next_state (transfer->ssm);
 }
 
@@ -945,6 +977,7 @@ egis057e_complete_verify (FpDeviceEgis057e *self, FpDevice *dev)
           fpi_device_verify_complete (dev,
             fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
               "EGIS057E_NO_PRESS: no usable press completed within the verify window"));
+          egis057e_report_present (dev, FALSE);
           return TRUE;
         }
       egis057e_report_verify_verdict (self, dev);
@@ -956,6 +989,7 @@ egis057e_complete_verify (FpDeviceEgis057e *self, FpDevice *dev)
   self->verify_deadline = 0;
   self->action_reported = TRUE;
   fpi_device_verify_complete (dev, NULL);
+  egis057e_report_present (dev, FALSE);
   return TRUE;
 }
 
@@ -1075,6 +1109,9 @@ egis057e_handle_enroll (FpDeviceEgis057e *self, FpDevice *dev,
   fp_info ("Enroll stage %u/%d captured (%d features)",
            self->enroll_stage, stages, fs->n);
 
+  /* A non-final accepted stage is followed by the settle's awaiting_release
+   * lift wait; no retry hint must follow a successful stage (GNOME reacts
+   * inconsistently to a retry mapped to enroll-retry-scan after acceptance). */
   if (self->enroll_stage < (guint) stages)
     return FALSE;
 
@@ -1089,6 +1126,7 @@ egis057e_handle_enroll (FpDeviceEgis057e *self, FpDevice *dev,
 
   self->action_reported = TRUE;
   fpi_device_enroll_complete (dev, g_object_ref (self->enroll_print), NULL);
+  egis057e_report_present (dev, FALSE);
   return TRUE;
 }
 
@@ -1214,9 +1252,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
     {
       fp_warn ("short image payload: received %zd/%d bytes",
                transfer->actual_length, EGIS057E_IMAGE_LEN);
-      fpi_device_report_finger_status_changes (dev,
-                                               FP_FINGER_STATUS_NONE,
-                                               FP_FINGER_STATUS_PRESENT);
+      egis057e_report_present (dev, FALSE);
       self->capture_protocol_error = TRUE;
       fpi_ssm_jump_to_state (transfer->ssm, SM_CAPTURE_FINISH);
       return;
@@ -1344,7 +1380,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
           if (present)
             {
               self->verify_lift_frames = 0;
-              fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
+              egis057e_report_present (dev, TRUE);
             }
           else if (absent)
             {
@@ -1355,7 +1391,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
             {
               fp_dbg ("finger lifted after verdict; completing verify");
               fp_info ("EGIS057E_VERIFY_LIFTED");
-              fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+              egis057e_report_present (dev, FALSE);
               egis057e_complete_verify (self, dev);
               fpi_ssm_mark_completed (transfer->ssm);
               return;
@@ -1422,11 +1458,9 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               fp_dbg ("finger released");
               self->awaiting_release = FALSE;
               self->release_frames = 0;
-              fpi_device_report_finger_status_changes (dev,
-                                                       FP_FINGER_STATUS_NONE,
-                                                       FP_FINGER_STATUS_PRESENT);
+              egis057e_report_present (dev, FALSE);
               if (!self->action_reported)
-                fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+                egis057e_report_needed (dev);
             }
           goto image_done;
         }
@@ -1453,6 +1487,8 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               self->finger_frames = 0;
               self->no_contact_frames = 0;
               self->have_touch_best_frame = FALSE;
+              egis057e_report_present (dev, FALSE);
+              self->retry_reported = FALSE;
               goto image_done;
             }
 
@@ -1484,7 +1520,19 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               if (!(present && self->have_touch_best_frame))
                 {
                   /* Presence persists but no USABLE frame yet: keep collecting.
-                   * The stuck-presence watchdog bounds a weak press. */
+                   * When the window is exhausted, give ENROLL one-shot on-screen
+                   * feedback; the retry is now emitted during the settle while
+                   * finger-present is reported (from SETTLE_START). */
+                  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
+                      self->touch_settle_frames >= window &&
+                      !self->retry_reported)
+                    {
+                      self->retry_reported = TRUE;
+                      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                          "Weak or off-center fingerprint; reposition your finger"));
+                    }
+                  /* The stuck-presence watchdog bounds a weak press. */
                   goto image_done;
                 }
 
@@ -1497,9 +1545,8 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               self->no_contact_frames = 0;
               self->reported_image = TRUE;
               self->present_since = 0;
-              fpi_device_report_finger_status_changes (dev,
-                                                       FP_FINGER_STATUS_PRESENT,
-                                                       FP_FINGER_STATUS_NEEDED);
+              self->retry_reported = FALSE;
+              egis057e_report_present (dev, TRUE);
 
               if (egis057e_deliver_frame (self, dev, self->touch_best_frame))
                 {
@@ -1580,7 +1627,12 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
             self->touch_settle_frames = 0;
             self->no_contact_frames = 0;
             self->have_touch_best_frame = FALSE;
+            self->retry_reported = FALSE;
             self->touch_pending = TRUE;
+            /* The finger is now on the sensor: report PRESENT when the turn opens
+             * (matches proven drivers; the weak-press retry is then emitted while
+             * finger-present is true). */
+            egis057e_report_present (dev, TRUE);
             egis057e_watchdog_progress (self);
             fp_info ("EGIS057E_SETTLE_START");
             fp_dbg ("press detected (%u consecutive PRESENT frames); starting settle",
@@ -1835,6 +1887,7 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
       self->verify_lift_deadline = 0;
       self->action_reported = TRUE;
       fpi_device_verify_complete (dev, NULL);
+      egis057e_report_present (dev, FALSE);
       return;
     }
 
@@ -1853,6 +1906,7 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
     case FPI_DEVICE_ACTION_VERIFY:
       fpi_device_verify_complete (dev, error);
+      egis057e_report_present (dev, FALSE);
       break;
 
     case FPI_DEVICE_ACTION_CAPTURE:
@@ -2006,7 +2060,7 @@ dev_capture (FpDevice *dev)
 
   /* The EH57E has no usable hardware finger bit in image mode, so the capture
    * loop always performs software touch detection. */
-  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+  egis057e_report_needed (dev);
   egis057e_start_capture (dev);
 }
 
@@ -2027,7 +2081,7 @@ dev_enroll (FpDevice *dev)
   self->enroll_rejects = 0;
 
   fp_dbg ("Enroll requested (%d stages)", EGIS057E_ENROLL_STAGES);
-  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+  egis057e_report_needed (dev);
   egis057e_start_capture (dev);
 }
 
@@ -2060,6 +2114,7 @@ dev_verify (FpDevice *dev)
       fpi_device_verify_complete (dev,
                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                                             "enrolled print has no usable EH57E template (outdated or invalid format); delete it and re-enroll"));
+      egis057e_report_present (dev, FALSE);
       return;
     }
 
@@ -2070,12 +2125,13 @@ dev_verify (FpDevice *dev)
       fpi_device_verify_complete (dev,
                                   fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
                                                             "enrolled print has too few EH57E frames to ever match; delete it and re-enroll"));
+      egis057e_report_present (dev, FALSE);
       return;
     }
 
   fp_dbg ("Verify requested (multi-frame probes), gallery=%u frames",
           self->verify_gallery_n);
-  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+  egis057e_report_needed (dev);
   egis057e_start_capture (dev);
   /* No-press bound; replaced by the total deadline at the first press. */
   self->verify_deadline = g_get_monotonic_time () +
