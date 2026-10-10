@@ -1714,7 +1714,8 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                 present, absent, self->finger_frames, EGIS057E_PRESENCE_FRAMES,
                 self->idle_absent_streak, self->next_poll_ms);
 
-        if (self->finger_frames >= EGIS057E_PRESENCE_FRAMES)
+        if (self->bg_valid &&
+            self->finger_frames >= EGIS057E_PRESENCE_FRAMES)
           {
             self->finger_frames = 0;
             self->touch_settle_frames = 0;
@@ -2127,7 +2128,11 @@ egis057e_start_capture (FpDevice *dev)
   self->identical_frames = 0;
   self->latch_recoveries = 0;
   self->awaiting_release_since = 0;
-  self->arm_needs_clear = TRUE;   /* no settle until the sensor reads clear twice */
+  /* NOTE: arm_needs_clear is NOT set here. The early baseline seed (below in
+   * image_recv_cb) makes the presence trigger coverage-based, so the old
+   * clear-to-arm gate would deadlock on a sensor whose idle frames look
+   * "present" to the absolute gate. It is still set by the latch/release-stuck
+   * recovery paths. */
   /* bg_q8/bg_valid/bg_warmup/noise_mad persist across actions (seeded once in
    * dev_open) so the drift-robust baseline survives; arm_needs_clear is now set
    * per action and by the latch/release-stuck recovery paths. */
