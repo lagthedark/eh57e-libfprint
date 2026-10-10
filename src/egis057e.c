@@ -61,11 +61,12 @@
 #define EGIS057E_RELEASE_STUCK_MS     4000  /* bound the post-stage lift wait */
 #define EGIS057E_LATCH_FRAMES   3   /* consecutive byte-identical polls => latched */
 #define EGIS057E_IDLE_POLL_FAST_MS    250
-#define EGIS057E_ACTIVE_POLL_MS       125  /* while a finger is present */
+#define EGIS057E_ACTIVE_POLL_MS        80  /* while a finger is present */
 #define EGIS057E_IDLE_POLL_MID_MS     500
 #define EGIS057E_IDLE_POLL_SLOW_MS   1000
 #define EGIS057E_PRESENCE_FRAMES           2
 #define EGIS057E_SETTLING_FRAMES           4
+#define EGIS057E_VERIFY_SETTLING_FRAMES    2  /* verify delivers sooner (large score margin) */
 #define EGIS057E_TOUCH_SETTLE_MAX_FRAMES   8
 #define EGIS057E_RELEASE_FRAMES            2
 #define EGIS057E_MIN_IMAGE_STDDEV          15.0
@@ -1723,7 +1724,9 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
           fp_info ("EGIS057E_SETTLE %u %u",
                    MIN (self->touch_settle_frames, window), window);
 
-          if (self->touch_settle_frames >= EGIS057E_SETTLING_FRAMES)
+          if (self->touch_settle_frames >=
+              (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY ?
+                 EGIS057E_VERIFY_SETTLING_FRAMES : EGIS057E_SETTLING_FRAMES))
             {
               if (!(present && self->have_touch_best_frame))
                 {
