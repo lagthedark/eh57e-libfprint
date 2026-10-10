@@ -82,6 +82,7 @@
 /* VERIFY must always complete: a finger-held press produces no lift, so the
  * probe-collection loop is time-bounded. */
 #define EGIS057E_VERIFY_START_TIMEOUT_MS    25000  /* no press yet -> NO_PRESS */
+#define EGIS057E_VERIFY_FAIL_MS            3500   /* weak held press -> standard no-match */
 #define EGIS057E_VERIFY_TOTAL_MS            6000   /* from first probe -> done */
 /* After a verdict, wait for the finger to be lifted before completing so the
  * next attempt does not re-read the same press. Bounded; if the finger stays
@@ -1058,6 +1059,9 @@ egis057e_verify_fail_early (FpDeviceEgis057e *self, FpDevice *dev)
     return;
 
   self->verify_verdict_done = TRUE;
+  /* fprintd restarts the verify right after this verdict; do not let the
+   * restart re-read the same still-held finger. */
+  self->arm_needs_clear = TRUE;
   fp_info ("EGIS057E_VERIFY_FAIL early (no usable press); verdict NO MATCH");
   fpi_device_verify_report (dev, FPI_MATCH_FAIL, NULL, NULL);
 
@@ -1429,12 +1433,36 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
           return;
         }
 
-      /* Seed the per-pixel background from the first live frames of the action
-       * (the sensor is idle at action start) BEFORE the arm gate can block, so
-       * presence can be decided by coverage instead of the absolute gate, which
-       * is trivially satisfied by this sensor's idle frames. No-ops once valid. */
-      if (!self->bg_valid)
+      /* Live-finger guard: a frame deviating from the running seed mean
+       * beyond EGIS057E_BG_SEED_MAD_MAX is a press onset (or a level shift),
+       * not idle -- it would poison the baseline. Reset the accumulator, do
+       * not seed the frame. Never seed while a press cycle is in flight.
+       * No-ops once valid. */
+      if (!self->bg_valid &&
+          !self->touch_pending && !self->awaiting_release &&
+          !self->verify_waiting_lift)
         {
+          if (self->bg_warmup > 0)
+            {
+              guint64 dev_sum = 0;
+
+              for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
+                {
+                  gint d = (gint) transfer->buffer[i] -
+                           (gint) ((self->bg_q8[i] / self->bg_warmup) >> 8);
+                  dev_sum += ABS (d);
+                }
+
+              if ((double) dev_sum / EGIS057E_IMAGE_LEN >
+                  EGIS057E_BG_SEED_MAD_MAX)
+                {
+                  fp_dbg ("early seed reset: frame deviates from partial mean (press or shift)");
+                  memset (self->bg_q8, 0, EGIS057E_IMAGE_LEN * sizeof (guint32));
+                  self->bg_warmup = 0;
+                  goto image_done;
+                }
+            }
+
           for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
             self->bg_q8[i] += (guint32) transfer->buffer[i] << 8;
           self->bg_warmup++;
@@ -1444,6 +1472,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                 self->bg_q8[i] /= EGIS057E_BG_WARMUP_FRAMES;
               self->bg_valid = TRUE;
               self->bg_warmup = 0;
+              self->finger_frames = 0;
               fp_info ("EGIS057E_BG_SEED (early)");
             }
         }
@@ -1680,7 +1709,8 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                    * feedback; the retry is now emitted during the settle while
                    * finger-present is reported (from SETTLE_START). */
                   if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY &&
-                      self->touch_settle_frames >= window)
+                      self->present_since != 0 &&
+                      now - self->present_since >= (gint64) EGIS057E_VERIFY_FAIL_MS * 1000)
                     {
                       fp_info ("EGIS057E_VERIFY_FAIL early (weak press, no usable frame)");
                       egis057e_verify_fail_early (self, dev);
@@ -1729,32 +1759,6 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
       /* State: waiting. Non-blocking background seed, then presence trigger. */
       {
-        if (!self->bg_valid)
-          {
-            /* Seed from any frame that is not a LIVE structured press (classic
-             * idle frames, or latched/stale frames — both are valid change-
-             * detection references). A live structured frame is excluded so a
-             * finger resting on the sensor at action start cannot poison the
-             * baseline; the arm gate holds until it lifts, then idle frames seed
-             * normally. */
-            if (!(abs_gate && mean_difference > 0.0))
-              {
-                for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
-                  self->bg_q8[i] += (guint32) transfer->buffer[i] << 8;
-                self->bg_warmup++;
-                if (self->bg_warmup >= EGIS057E_BG_WARMUP_FRAMES)
-                  {
-                    for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
-                      self->bg_q8[i] /= EGIS057E_BG_WARMUP_FRAMES;
-                    self->bg_valid = TRUE;
-                    self->bg_warmup = 0;
-                    fp_info ("EGIS057E_BG_SEED (idle or stale reference)");
-                  }
-              }
-            /* NOTE: do NOT goto image_done here — fall through so the presence
-             * trigger can still fire while the baseline warms up. */
-          }
-
         /* Absent frames refine the background and the idle residual floor. */
         if (absent)
           {
@@ -1778,7 +1782,11 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                                  EGIS057E_IDLE_POLL_MID_MS :
                                  EGIS057E_IDLE_POLL_SLOW_MS));
 
-        if (present)
+        /* Blind-window guard: before the baseline exists, presence is the
+         * abs_gate fallback which this sensor's noisy idle (stddev 24-66)
+         * ALWAYS satisfies -- counting those frames as finger contact arms a
+         * phantom SETTLE the moment the early seed flips bg_valid. */
+        if (present && self->bg_valid)
           self->finger_frames++;
         else
           self->finger_frames = 0;
