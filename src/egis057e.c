@@ -61,6 +61,7 @@
 #define EGIS057E_RELEASE_STUCK_MS     4000  /* bound the post-stage lift wait */
 #define EGIS057E_LATCH_FRAMES   3   /* consecutive byte-identical polls => latched */
 #define EGIS057E_IDLE_POLL_FAST_MS    250
+#define EGIS057E_ACTIVE_POLL_MS       125  /* while a finger is present */
 #define EGIS057E_IDLE_POLL_MID_MS     500
 #define EGIS057E_IDLE_POLL_SLOW_MS   1000
 #define EGIS057E_PRESENCE_FRAMES           2
@@ -1740,7 +1741,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
         else if (present)
           self->idle_absent_streak = 0;
 
-        self->next_poll_ms = present ? EGIS057E_IDLE_POLL_FAST_MS :
+        self->next_poll_ms = present ? EGIS057E_ACTIVE_POLL_MS :
                              (self->idle_absent_streak < 8 ?
                                 EGIS057E_IDLE_POLL_FAST_MS :
                               (self->idle_absent_streak < 80 ?
