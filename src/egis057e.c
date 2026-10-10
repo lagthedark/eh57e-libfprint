@@ -159,6 +159,7 @@ struct _FpDeviceEgis057e
   guint       weak_touch_frames; /* consecutive weak-touch frames (WAITING) */
   guint       weak_gap_frames;  /* consecutive clearly-no-touch frames      */
   gint64      weak_hint_deadline; /* next allowed weak-touch hint (cooldown) */
+  gboolean    weak_hint_alt;      /* alternate retry code so GNOME re-shows   */
   guint8      calibration_sample;
   gboolean    have_calibration_sample;
 
@@ -1754,18 +1755,26 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               {
                 self->weak_touch_frames++;
                 self->weak_gap_frames = 0;
-                /* Cooldown, not one-shot: every genuine weak attempt must get
-                 * feedback (previously only the first hint ever showed). */
                 if (self->weak_touch_frames >= EGIS057E_TOUCH_FRAMES &&
                     now >= self->weak_hint_deadline)
                   {
                     self->weak_hint_deadline = now +
                       (gint64) EGIS057E_TOUCH_HINT_COOLDOWN_MS * 1000;
-                    fp_info ("EGIS057E_WEAK_TOUCH hint (cov %.1f%% mad %.1f)",
-                             presence.coverage, presence.mad);
-                    fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
-                      fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
-                        "Touch too light: press flatter so more of the finger touches the sensor"));
+                    /* Alternate the retry code: GNOME 50 suppresses a repeat of
+                     * the SAME status string, so alternating centered<->general
+                     * keeps consecutive hints distinct (and therefore shown). */
+                    fp_info ("EGIS057E_WEAK_TOUCH hint (cov %.1f%% mad %.1f, code %s)",
+                             presence.coverage, presence.mad,
+                             self->weak_hint_alt ? "general" : "centered");
+                    if (self->weak_hint_alt)
+                      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
+                          "Touch too light: press flatter so more of the finger touches the sensor"));
+                    else
+                      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                          "Touch too light: press flatter so more of the finger touches the sensor"));
+                    self->weak_hint_alt = !self->weak_hint_alt;
                   }
               }
             else
@@ -1773,7 +1782,11 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                 self->weak_touch_frames = 0;
                 self->weak_gap_frames++;
                 if (self->weak_gap_frames >= EGIS057E_RELEASE_FRAMES)
-                  self->weak_gap_frames = 0;
+                  {
+                    /* Touch ended: re-arm so the next touch hints immediately. */
+                    self->weak_gap_frames = 0;
+                    self->weak_hint_deadline = 0;
+                  }
               }
           }
 
