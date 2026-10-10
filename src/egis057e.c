@@ -72,6 +72,7 @@
 #define EGIS057E_TOUCH_COVERAGE      10.0  /* weak-touch hint: % cov (idle <=9)  */
 #define EGIS057E_TOUCH_MAD            9.5  /*  and mean |dev| (idle <=8)         */
 #define EGIS057E_TOUCH_FRAMES           2  /* consecutive weak frames to hint    */
+#define EGIS057E_TOUCH_HINT_COOLDOWN_MS 1800  /* re-hint at most this often      */
 
 /* VERIFY must always complete: a finger-held press produces no lift, so the
  * probe-collection loop is time-bounded. */
@@ -157,7 +158,7 @@ struct _FpDeviceEgis057e
   gboolean    retry_reported;   /* one-shot weak-press retry per touch */
   guint       weak_touch_frames; /* consecutive weak-touch frames (WAITING) */
   guint       weak_gap_frames;  /* consecutive clearly-no-touch frames      */
-  gboolean    weak_hint_done;   /* one-shot weak-touch hint per touch       */
+  gint64      weak_hint_deadline; /* next allowed weak-touch hint (cooldown) */
   guint8      calibration_sample;
   gboolean    have_calibration_sample;
 
@@ -1753,10 +1754,13 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               {
                 self->weak_touch_frames++;
                 self->weak_gap_frames = 0;
+                /* Cooldown, not one-shot: every genuine weak attempt must get
+                 * feedback (previously only the first hint ever showed). */
                 if (self->weak_touch_frames >= EGIS057E_TOUCH_FRAMES &&
-                    !self->weak_hint_done)
+                    now >= self->weak_hint_deadline)
                   {
-                    self->weak_hint_done = TRUE;
+                    self->weak_hint_deadline = now +
+                      (gint64) EGIS057E_TOUCH_HINT_COOLDOWN_MS * 1000;
                     fp_info ("EGIS057E_WEAK_TOUCH hint (cov %.1f%% mad %.1f)",
                              presence.coverage, presence.mad);
                     fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
@@ -1769,10 +1773,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                 self->weak_touch_frames = 0;
                 self->weak_gap_frames++;
                 if (self->weak_gap_frames >= EGIS057E_RELEASE_FRAMES)
-                  {
-                    self->weak_gap_frames = 0;
-                    self->weak_hint_done = FALSE;   /* touch gone: recharge */
-                  }
+                  self->weak_gap_frames = 0;
               }
           }
 
@@ -1790,7 +1791,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
             self->retry_reported = FALSE;
             self->weak_touch_frames = 0;
             self->weak_gap_frames = 0;
-            self->weak_hint_done = FALSE;
+            self->weak_hint_deadline = 0;
             self->touch_pending = TRUE;
             /* The finger is now on the sensor: report PRESENT when the turn opens
              * (matches proven drivers; the weak-press retry is then emitted while
@@ -2199,7 +2200,7 @@ egis057e_start_capture (FpDevice *dev)
   self->awaiting_release_since = 0;
   self->weak_touch_frames = 0;
   self->weak_gap_frames = 0;
-  self->weak_hint_done = FALSE;
+  self->weak_hint_deadline = 0;
   /* NOTE: arm_needs_clear is NOT set here. The early baseline seed (below in
    * image_recv_cb) makes the presence trigger coverage-based, so the old
    * clear-to-arm gate would deadlock on a sensor whose idle frames look
