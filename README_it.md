@@ -1,199 +1,127 @@
 # Driver Linux per il sensore EH57E (libfprint)
 
-Login con impronta digitale su Linux per il sensore **Egis Technology /
-LighTuning EH57E** (`USB 1c7a:057e`), montato su alcuni laptop recenti. Il
-produttore fornisce driver solo per Windows; questo progetto fa
-reverse-engineering del protocollo USB e del motore di matching del produttore
-per offrire **login con impronta su Linux (GNOME / fprintd)**.
+Questo è un piccolo driver [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint)
+per il sensore di impronte del mio **Samsung Galaxy Book Pro 360**, un
+**Egis / LighTuning EH57E** (`USB 1c7a:057e`). Egis fornisce solo driver per
+Windows, quindi il progetto fa reverse-engineering del protocollo USB e del
+motore di matching per far funzionare il login con impronta su Linux. Lo uso su
+**Fedora Bluefin** con GNOME. L'enroll funziona e lo sblocco di solito avviene
+alla prima pressione, anche se non sempre; quando aggancia, ci mette meno di
+tre secondi.
 
-**In breve — a me funziona.** Lo uso ogni giorno per il login GNOME su Fedora
-Bluefin (immutabile): l'enroll completa e il lock screen si sblocca alla
-**prima pressione**, in circa un secondo. Tutto il necessario per lo stesso
-sensore è in questo repository. Se hai questo sensore e funziona anche a te,
-tienilo e miglioralo — patch e pulizie sono benvenute. È un progetto
-hobbistico di interoperabilità: nessuna garanzia.
+Prima di tutto: **è una funzione di comodità, non di sicurezza.** Il sensore si
+limita a inviare un'immagine su USB — niente match-on-chip e niente rilevamento
+di vitalità — quindi è della stessa categoria di Windows Hello, non di un
+lucchetto. Tieni sempre la password come fallback.
 
-> **Stato / ambito: SOLO LIVELLO "CONVENIENZA".**
-> Il sensore è un semplice sensore d'immagine: **niente match-on-chip, niente
-> rilevamento di vitalità, e l'immagine dell'impronta viaggia in chiaro su USB**.
-> Questo driver quindi *non* è un confine di sicurezza — è una funzione di
-> comodità (come Windows Hello), e **una password deve restare sempre come
-> fallback**. **Non** è idoneo ad alcuna certificazione biometrica.
+## Che cos'è davvero
 
----
+I frame dell'EH57E sono 70×57 pixel e non contengono minuzie NBIS, quindi il
+percorso immagine normale di libfprint qui non è utilizzabile. Il driver è
+quindi una semplice sottoclasse di `FpDevice` — nessuna patch al core — che
+parla direttamente il protocollo USB del produttore e implementa da sé enroll e
+verify. Il matcher è una reimplementazione del motore del produttore, ottenuta
+per reverse-engineering dal driver Windows; il rilevamento del tocco costruisce
+uno sfondo per-pixel dal frame di calibrazione a sensore vuoto dello stesso
+sensore e guarda quanto dell'immagine se ne discosta. Il resto delle note di
+reverse-engineering e di design sta in `docs/`.
 
-## Funziona sul tuo dispositivo?
+Funziona, ma prendilo come un progetto hobbistico che per ora va bene su una
+macchina sola.
 
-Hai quasi certamente questo sensore se `lsusb` mostra `1c7a:057e`. Il driver
-punta a quel singolo sensore; altre parti Egis sono fuori ambito.
+## Il dispositivo
 
-Comportamento attuale su Fedora Bluefin + GNOME + fprintd:
+L'EH57E è il sensore della mia macchina, un **Samsung Galaxy Book Pro 360**
+(2021; i modelli da 13,3" e 15,6" sono NP930QDB e NP950QDB). La stessa parte
+`1c7a:057e` compare anche sul **Galaxy Book Pro** non-360 dello stesso anno
+(modelli 935XDB e 950XDB), e non ho trovato portatili non-Samsung che lo usino.
+Altre parti Egis — per esempio `1c7a:0575` (EH575) — sono sensori diversi e
+fuori ambito. Se `lsusb` mostra `1c7a:057e`, questo driver è per te.
 
-- **Enroll** (Impostazioni → Utenti → Impronta digitale): completa i 5 stadi,
-  con messaggi a schermo quando una pressione è debole o il dito viene alzato
-  troppo presto.
-- **Lock screen / login**: sblocca alla **prima pressione** in ~1 s.
-- **Dito sbagliato**: messaggio pulito *"impossibile abbinare"* e ri-prompt —
-  nessun blocco.
-- **Completamente reversibile**: `undeploy-fprintd.sh` ripristina l'fprintd di
-  sistema.
+## Compilazione
 
----
+È un driver a livello di sorgente, non una patch. Serve il sorgente libfprint
+alla versione **1.94.100** (quella di Fedora; ABI-compatibile con fprintd
+1.94.x). Copia il driver in un albero libfprint, registralo e compila:
 
-## Hardware
-
-| | |
-|---|---|
-| Vendor / prodotto | Egis Technology EH57E (`1c7a:057e`) |
-| Sensore | sensore d'immagine in scala di grigi 70×57 px |
-| Protocollo | USB vendor puro (control transfer + bulk); niente match-on-chip |
-| Immagini | inviate in chiaro su USB |
-
----
-
-## Architettura
-
-- **Sottoclasse pura di `FpDevice`** — non `FpImageDevice`, e **nessuna patch al
-  core** di libfprint. I frame EH57E sono 70×57 e non contengono minuzie NBIS,
-  quindi il percorso immagine standard è inutilizzabile; enroll/verify sono
-  implementati direttamente.
-- **Trasporto USB + catena di pacchetti init/calibrazione + macchina a stati di
-  rilevamento del tocco** vivono nel driver (`src/egis057e.c`).
-- **Matcher** (`src/egis057e-matcher.c`): reimplementazione fedele del motore
-  del produttore (`EgisTouchFPEngine057E.dll`), ottenuta per reverse-engineering
-  (tabelle/blob estratti via signature scan). **Non** è la ricostruzione EH575.
-- **Rilevamento di presenza** tramite un baseline di sfondo "caldo" per-pixel,
-  seminato a ogni azione dal frame di calibrazione (sensore vuoto, `0x72`), così
-  il rilevamento è coverage-based fin dal primo frame live.
-  Vedi `docs/analysis/eh57e-presence-baseline.md`.
-
-## Come funziona il rilevamento (breve)
-
-Il sensore non ha un bit "dito" utilizzabile, quindi il contatto è dedotto dalle
-immagini:
-
-1. Ogni azione esegue la catena di init del produttore, che legge un **frame di
-   calibrazione a sensore vuoto** (`0x72`). Quel frame diventa lo sfondo
-   per-pixel.
-2. Un frame live viene confrontato pixel per pixel con lo sfondo. La frazione di
-   pixel che deviano oltre una soglia adattiva è la **coverage**.
-3. Coverage ≥ 12 % ⇒ dito presente; ≤ 10 % ⇒ assente; in mezzo è isteresi.
-4. Due frame "present" consecutivi avviano un **settle**, che sceglie il frame
-   migliore; quel frame diventa uno stadio di enroll o una sonda di verify.
-5. Il verify riporta il match alla prima sonda corrispondente; una pressione
-   sbagliata viene scartata subito con un pulito *"impossibile abbinare"*.
-
-Questo design conta perché lo stato di riposo del sensore è rumoroso e bimodale
-(i frame vuoti possono sembrare quasi un dito con soglie assolute ingenue), e
-perché lo sfondo viene azzerato a ogni apertura del dispositivo — seminarlo dal
-frame di calibrazione elimina la "finestra cieca" in cui una pressione iniziale
-veniva silenziosamente persa.
-
-## Struttura del repository
-
-```
-src/                      sorgenti del driver (da copiare in libfprint)
-  egis057e.c / .h
-  egis057e-matcher.c / .h
-tools/                    tool CLI + Makefile (da copiare in libfprint/tools)
-  egis057e_enroll.c       CLI enroll / verify / monitor / capture
-  egis057e_capture.c
-  egis057e-match-test.c
-scripts/                  helper operativi + deploy
-  deploy-fprintd.sh       installa la lib per l'fprintd di sistema (reversibile)
-  undeploy-fprintd.sh     ripristino
-  fprintd-debug-on.sh     abilita il debug del driver nel journal di fprintd
-  eh57e.sh / eh57e-debug.sh / eh57e-cleanup.sh / reset-sensor.sh / setup-access.sh
-docs/analysis/            note di reverse-engineering + design
-docs/engine/              artefatti di estrazione tabelle (nessun binario vendor)
-AGENTS.md                 guida per agenti di coding / contributori
-README_it.md              questa traduzione italiana del README
+```sh
+cp src/egis057e.c src/egis057e.h src/egis057e-matcher.c src/egis057e-matcher.h \
+   <libfprint>/libfprint/drivers/
+cp tools/egis057e_*.c tools/Makefile <libfprint>/tools/
 ```
 
-## Build
+In `<libfprint>/libfprint/meson.build`, aggiungi il driver insieme agli altri:
 
-Serve il sorgente libfprint **1.94.100** (corrisponde all'SRPM Fedora;
-ABI-compatibile con fprintd 1.94.x). È un driver a livello di sorgente, non una
-patch.
+```meson
+'egis057e' : files('drivers/egis057e.c', 'drivers/egis057e-matcher.c'),
+```
 
-1. Prendi l'albero libfprint alla 1.94.100 e sovrapponi i sorgenti:
-   ```sh
-   cp src/egis057e.c src/egis057e.h src/egis057e-matcher.c src/egis057e-matcher.h \
-      <libfprint>/libfprint/drivers/
-   cp tools/egis057e_*.c tools/Makefile <libfprint>/tools/
-   ```
-2. Registra il driver. In `<libfprint>/libfprint/meson.build` aggiungi una entry
-   (la mappa driver è indicizzata sul numero di modello del sensore):
-   ```meson
-   'egis057e' : files('drivers/egis057e.c', 'drivers/egis057e-matcher.c'),
-   ```
-   e in `<libfprint>/meson.build` (la mappa delle opzioni driver):
-   ```meson
-   'egis057e': {},
-   ```
-3. Compila:
-   ```sh
-   meson setup build -Ddrivers=egis057e
-   ninja -C build
-   make -C tools
-   ```
-   Verifica della registrazione: `1c7a:057e | Egis Technology EH57E Touch Fingerprint Sensor`.
+e in `<libfprint>/meson.build`:
 
-## Deploy sull'fprintd di sistema (login GNOME)
+```meson
+'egis057e': {},
+```
 
-Su Fedora immutabile (Bluefin / Silverblue) **non si scrive in `/usr`**.
-Lo script incluso installa la libreria sotto `/opt`, aggiunge un drop-in
-systemd (`LD_LIBRARY_PATH`) e un'etichetta SELinux `lib_t`; è completamente
-reversibile.
+poi
+
+```sh
+meson setup build -Ddrivers=egis057e
+ninja -C build
+make -C tools
+```
+
+Alla fine dovresti avere registrato `1c7a:057e | Egis Technology EH57E Touch
+Fingerprint Sensor`.
+
+## Installazione per il login GNOME
+
+Su Fedora immutabile (Bluefin / Silverblue) non si può scrivere in `/usr`, così
+lo script incluso installa la libreria sotto `/opt`, indica a fprintd di usarla
+con un drop-in systemd e le mette l'etichetta SELinux. È reversibile:
 
 ```sh
 sudo bash scripts/deploy-fprintd.sh
-# poi: Impostazioni -> Utenti -> Impronta digitale (enroll), blocca e prova
-sudo bash scripts/undeploy-fprintd.sh   # per tornare all'fprintd di sistema
+# poi: Impostazioni -> Utenti -> Impronta digitale, e blocca lo schermo per provare
+sudo bash scripts/undeploy-fprintd.sh   # torna all'fprintd di sistema
 ```
 
-## Uso della CLI in sviluppo
+## Provarlo senza toccare il sistema
+
+C'è una piccola CLI, utile mentre si smanetta:
 
 ```sh
-bash scripts/eh57e.sh monitor 6        # loop di verify continuo, dito 6 = indice destro
-bash scripts/eh57e-debug.sh verify 6   # debug verboso del driver -> hwtest/verify-debug.log
-bash scripts/eh57e-cleanup.sh          # libera un device bloccato (killa residui + USB reset)
+bash scripts/eh57e.sh monitor 6        # loop di verify, 6 = indice destro
+bash scripts/eh57e-debug.sh verify 6   # log verboso del driver
+bash scripts/eh57e-cleanup.sh          # sblocca il lettore se si impalla
 ```
 
-Log verbosi del driver durante l'uso normale di fprintd (temporaneo):
+Se ti serve il log del driver mentre usi il login GNOME normale, c'è
+`scripts/fprintd-debug-on.sh` (temporaneo; vedi `AGENTS.md`).
 
-```sh
-sudo bash scripts/fprintd-debug-on.sh
-sudo systemctl restart fprintd
-# riproduci, poi:
-sudo journalctl -u fprintd --since "3 min ago" --no-pager | grep -E "EGIS057E|Verify|Enroll"
-```
+## Limiti, onestamente
 
-## Limiti e onestà
+Il matcher è una reimplementazione di un motore proprietario, scritta per
+interoperabilità. È calibrato su poche dita, quindi aspettati ogni tanto un
+falso accetta o un falso rifiuta, e considera il tuning come un lavoro in
+corso. I binari del produttore (`EgisTouchFP*.dll`, il `.inf`) **non** sono
+inclusi — provengono dal Windows Update Catalog e non sono ridistribuibili;
+sono stati usati solo in locale, per studiare il protocollo ed estrarre le
+tabelle. Poiché il matcher è ricostruito e non originale, questo driver non può
+essere proposto upstream a libfprint così com'è; una versione basata su un
+matcher aperto standard sarebbe la strada. Ed è stato provato davvero solo sul
+mio portatile, quindi aspettati spigoli altrove.
 
-- **Solo livello convenienza** (vedi in alto). Niente vitalità; un'immagine
-  latente sollevata potrebbe essere riprodotta. Tieni sempre un fallback password.
-- Il matcher è una reimplementazione di un motore proprietario, fatta per
-  interoperabilità; la separazione end-to-end è **preliminare** (calibrata su
-  poche dita). Considera il tuning di falsi accetta/rifiuta come in progress.
-- **I binari del produttore NON sono inclusi.** `EgisTouchFP057E.dll`,
-  `EgisTouchFPEngine057E.dll`, `EgisTouchFPSensor057E.dll` e il `.inf` provengono
-  dal Windows Update Catalog e **non sono ridistribuibili**; sono usati solo in
-  locale per estrarre tabelle native.
-- Poiché reimplementa un matcher proprietario, questo driver **non è
-  proponibile upstream a libfprint così com'è**. Una futura versione ripulita
-  (es. con un matcher aperto standard, se i frame sono adattabili) sarebbe la
-  strada verso l'upstream.
-- Testato su una sola macchina e un solo sensore; aspettati spigoli altrove.
+## Crediti
 
-## Contribuire
-
-Issue, report di test e patch sono benvenuti. Vedi `AGENTS.md` per il flusso di
-build e debug, i vincoli tassativi e le insidie note. I report sono più utili se
-includono i log marcati `EGIS057E` da `scripts/fprintd-debug-on.sh`.
+Questo progetto è stato realizzato con l'aiuto di un agente di coding IA:
+**OpenCode** (https://opencode.ai) guidato dalla configurazione
+**oh-my-opencode-slim** (https://github.com/alvinunreal/oh-my-opencode-slim).
+Buona parte del lavoro sul protocollo è partita dal precedente sforzo
+sull'EH575 (`cosct/libfprint-egis0575`), i cui coefficienti si sono rivelati
+condivisi in tutta la famiglia Egis EH5xx.
 
 ## Licenza
 
-I sorgenti del driver sono marcati `SPDX-License-Identifier: 0BSD` (vedi
-`LICENSE`). Le note di reverse-engineering e il tooling sono forniti per
-interoperabilità e uso personale.
+I sorgenti del driver sono `0BSD` (vedi `LICENSE`). Le note di
+reverse-engineering e il tooling sono forniti per interoperabilità e uso
+personale.
