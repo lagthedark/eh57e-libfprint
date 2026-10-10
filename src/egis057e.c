@@ -66,6 +66,12 @@
 #define EGIS057E_MIN_IMAGE_STDDEV          15.0
 #define EGIS057E_MIN_GRADIENT_RMS          30.0
 #define EGIS057E_MIN_INTENSITY_RANGE       30
+/* Weak-touch feedback: a touch the baseline detects (cov/mad above the idle
+ * floor) but below the settle trigger never starts a settle and would be
+ * completely silent. Non-settling; hint only (ENROLL). */
+#define EGIS057E_TOUCH_COVERAGE      10.0  /* weak-touch hint: % cov (idle <=9)  */
+#define EGIS057E_TOUCH_MAD            9.5  /*  and mean |dev| (idle <=8)         */
+#define EGIS057E_TOUCH_FRAMES           2  /* consecutive weak frames to hint    */
 
 /* VERIFY must always complete: a finger-held press produces no lift, so the
  * probe-collection loop is time-bounded. */
@@ -149,6 +155,9 @@ struct _FpDeviceEgis057e
   double      touch_best_quality;
   Egis057eImageQuality touch_best_q;
   gboolean    retry_reported;   /* one-shot weak-press retry per touch */
+  guint       weak_touch_frames; /* consecutive weak-touch frames (WAITING) */
+  guint       weak_gap_frames;  /* consecutive clearly-no-touch frames      */
+  gboolean    weak_hint_done;   /* one-shot weak-touch hint per touch       */
   guint8      calibration_sample;
   gboolean    have_calibration_sample;
 
@@ -1578,6 +1587,18 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               self->no_contact_frames = 0;
               self->have_touch_best_frame = FALSE;
               egis057e_report_present (dev, FALSE);
+              /* One-shot feedback for a press that left before producing a
+               * usable frame. Safe by construction: this branch only runs while
+               * the stage is still pending (nothing was delivered). The
+               * retry_reported check dedups against the settle-window hint. */
+              if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
+                  !self->retry_reported)
+                {
+                  fp_info ("EGIS057E_SETTLE_ABORT hint (lifted before a usable frame)");
+                  fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                    fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
+                      "Finger lifted too early; keep it on the sensor until the stage completes"));
+                }
               self->retry_reported = FALSE;
               goto image_done;
             }
@@ -1710,6 +1731,51 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
         else
           self->finger_frames = 0;
 
+        /* Weak-touch hint (ENROLL only): a touch the baseline detects (cov/mad
+         * above the idle floor) but below the settle trigger never starts a
+         * settle and would otherwise be completely silent. One hint per touch;
+         * the latch recharges after EGIS057E_RELEASE_FRAMES clearly-no-touch
+         * frames. WAITING runs strictly between touches, so this can never fire
+         * after an accepted stage. */
+        if (self->bg_valid &&
+            fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+          {
+            gboolean weak_touch = !present && !absent &&
+                                  presence.coverage >= EGIS057E_TOUCH_COVERAGE &&
+                                  presence.mad >= EGIS057E_TOUCH_MAD;
+
+            if (present)
+              {
+                self->weak_touch_frames = 0;
+                self->weak_gap_frames = 0;
+              }
+            else if (weak_touch)
+              {
+                self->weak_touch_frames++;
+                self->weak_gap_frames = 0;
+                if (self->weak_touch_frames >= EGIS057E_TOUCH_FRAMES &&
+                    !self->weak_hint_done)
+                  {
+                    self->weak_hint_done = TRUE;
+                    fp_info ("EGIS057E_WEAK_TOUCH hint (cov %.1f%% mad %.1f)",
+                             presence.coverage, presence.mad);
+                    fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                      fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                        "Touch too light: press flatter so more of the finger touches the sensor"));
+                  }
+              }
+            else
+              {
+                self->weak_touch_frames = 0;
+                self->weak_gap_frames++;
+                if (self->weak_gap_frames >= EGIS057E_RELEASE_FRAMES)
+                  {
+                    self->weak_gap_frames = 0;
+                    self->weak_hint_done = FALSE;   /* touch gone: recharge */
+                  }
+              }
+          }
+
         fp_dbg ("waiting (present=%d absent=%d): consecutive present %u/%u, idle_absent %u, poll %u ms",
                 present, absent, self->finger_frames, EGIS057E_PRESENCE_FRAMES,
                 self->idle_absent_streak, self->next_poll_ms);
@@ -1722,6 +1788,9 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
             self->no_contact_frames = 0;
             self->have_touch_best_frame = FALSE;
             self->retry_reported = FALSE;
+            self->weak_touch_frames = 0;
+            self->weak_gap_frames = 0;
+            self->weak_hint_done = FALSE;
             self->touch_pending = TRUE;
             /* The finger is now on the sensor: report PRESENT when the turn opens
              * (matches proven drivers; the weak-press retry is then emitted while
@@ -2128,6 +2197,9 @@ egis057e_start_capture (FpDevice *dev)
   self->identical_frames = 0;
   self->latch_recoveries = 0;
   self->awaiting_release_since = 0;
+  self->weak_touch_frames = 0;
+  self->weak_gap_frames = 0;
+  self->weak_hint_done = FALSE;
   /* NOTE: arm_needs_clear is NOT set here. The early baseline seed (below in
    * image_recv_cb) makes the presence trigger coverage-based, so the old
    * clear-to-arm gate would deadlock on a sensor whose idle frames look
