@@ -1045,6 +1045,32 @@ egis057e_begin_lift_wait (FpDeviceEgis057e *self, FpDevice *dev)
   fp_info ("EGIS057E_VERIFY_WAIT_LIFT");
 }
 
+/* Verify retry-exit: the ONE report of this action is a retry; the action
+ * completes immediately after it and fprintd (a) shows the hint via
+ * VerifyStatus(done=FALSE) and (b) auto-restarts a fresh verify action.
+ * The core allows exactly one verify_report per action (result_reported
+ * guard) — never report anything else after this. arm_needs_clear makes the
+ * restarted action wait for a clear frame, so a still-held finger cannot be
+ * re-read into a restart loop. */
+static void
+egis057e_verify_retry_exit (FpDeviceEgis057e *self, FpDevice *dev,
+                            FpDeviceRetry   code,
+                            const char      *msg)
+{
+  GError *error = fpi_device_retry_new_msg (code, "%s", msg);
+
+  self->verify_waiting_lift = FALSE;
+  self->verify_lift_frames = 0;
+  self->verify_lift_deadline = 0;
+  self->verify_deadline = 0;
+  self->verify_verdict_done = TRUE;   /* the single report slot is used */
+  self->action_reported = TRUE;
+  self->arm_needs_clear = TRUE;       /* next action arms only after a clear frame */
+  fp_info ("EGIS057E_VERIFY_RETRY exit (code %d)", (gint) code);
+  fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, error);
+  fpi_device_verify_complete (dev, NULL);
+}
+
 static guint
 egis057e_enroll_sim_threshold (void)
 {
@@ -1210,6 +1236,17 @@ egis057e_handle_verify (FpDeviceEgis057e *self, FpDevice *dev,
         egis057e_begin_lift_wait (self, dev);
         return FALSE;
       }
+
+    /* Gray zone [reject, threshold): this press was read but did not match.
+     * The core allows exactly ONE verify report per action, so a hint cannot
+     * be sent mid-action while still collecting: end the action with a retry
+     * instead — fprintd shows the hint and auto-restarts, gated on a clear
+     * frame by arm_needs_clear. */
+    fp_info ("Verify probe %u gray zone (best %d in [%d, threshold)); retry exit",
+             self->verify_probe_count, best, reject);
+    egis057e_verify_retry_exit (self, dev, FP_DEVICE_RETRY_REMOVE_FINGER,
+      "Finger not recognized; remove it and try again");
+    return TRUE;
   }
 
   if (self->verify_probe_count >= egis057e_verify_probe_target ())
@@ -1607,6 +1644,16 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               self->no_contact_frames = 0;
               self->have_touch_best_frame = FALSE;
               egis057e_report_present (dev, FALSE);
+              /* VERIFY: a press that left before producing a usable frame ends
+               * the action with a visible retry hint (fprintd re-arms). */
+              if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+                {
+                  fp_info ("EGIS057E_VERIFY_RETRY exit (lifted before a usable frame)");
+                  egis057e_verify_retry_exit (self, dev, FP_DEVICE_RETRY_GENERAL,
+                    "Finger lifted too early; place it back on the reader and hold");
+                  fpi_ssm_mark_completed (transfer->ssm);
+                  return;
+                }
               /* One-shot feedback for a press that left before producing a
                * usable frame. Safe by construction: this branch only runs while
                * the stage is still pending (nothing was delivered). The
@@ -1655,6 +1702,18 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                    * When the window is exhausted, give ENROLL one-shot on-screen
                    * feedback; the retry is now emitted during the settle while
                    * finger-present is reported (from SETTLE_START). */
+                  /* VERIFY: weak press held with no usable frame — end the
+                   * action with a visible "not centered" hint (fprintd re-arms)
+                   * instead of collecting silently until the deadline. */
+                  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY &&
+                      self->touch_settle_frames >= window)
+                    {
+                      fp_info ("EGIS057E_VERIFY_RETRY exit (weak press, no usable frame)");
+                      egis057e_verify_retry_exit (self, dev, FP_DEVICE_RETRY_CENTER_FINGER,
+                        "Weak or off-center press; reposition the finger and try again");
+                      fpi_ssm_mark_completed (transfer->ssm);
+                      return;
+                    }
                   if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
                       self->touch_settle_frames >= window &&
                       !self->retry_reported)
