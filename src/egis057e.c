@@ -55,6 +55,7 @@
 #define EGIS057E_BG_WARMUP_FRAMES    4
 #define EGIS057E_BG_SEED_MAD_MAX     15.0
 #define EGIS057E_STUCK_PRESENCE_MS   10000
+#define EGIS057E_LATCH_FRAMES   3   /* consecutive byte-identical polls => latched */
 #define EGIS057E_IDLE_POLL_FAST_MS    250
 #define EGIS057E_IDLE_POLL_MID_MS     500
 #define EGIS057E_IDLE_POLL_SLOW_MS   1000
@@ -183,6 +184,9 @@ struct _FpDeviceEgis057e
   guint                 arm_clear_frames;  /* consecutive ABSENT frames       */
   guint                 no_contact_frames; /* settle-abort counter            */
   gint64                action_deadline;  /* per-action watchdog progress    */
+  guint                 identical_frames;    /* consecutive byte-identical polls   */
+  guint                 latch_recoveries;    /* in-action re-init attempts (max 1) */
+  gint64                awaiting_release_since; /* release-wait bound anchor       */
 
   /* Per-pixel background baseline (presence authority) and idle cadence. */
   guint32              *bg_q8;            /* heap: IMAGE_LEN per-pixel bg, Q8 */
@@ -1297,6 +1301,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       Egis057ePresence presence;
       gboolean present;
       gboolean absent;
+      gboolean abs_gate;
       gint64 now;
 
       frame_mean_difference (transfer->buffer, self->previous_frame,
@@ -1304,12 +1309,10 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       memcpy (self->previous_frame, transfer->buffer, EGIS057E_IMAGE_LEN);
 
       quality = image_quality (transfer->buffer);
+      abs_gate = quality.standard_deviation >= EGIS057E_FALLBACK_SD &&
+                 quality.gradient_rms >= EGIS057E_FALLBACK_GRAD;
       presence = egis057e_presence_eval (self, transfer->buffer);
       {
-        gboolean abs_gate =
-          quality.standard_deviation >= EGIS057E_FALLBACK_SD &&
-          quality.gradient_rms >= EGIS057E_FALLBACK_GRAD;
-
         if (self->bg_valid)
           {
             /* Coverage present, but cross-checked against the absolute gate so
@@ -1332,6 +1335,46 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               egis057e_presence_threshold (self), present,
               quality.standard_deviation, quality.gradient_rms,
               quality.intensity_range);
+
+      /* Liveness: a live sensor never repeats a frame byte-exactly. */
+      if (mean_difference == 0.0)
+        self->identical_frames++;
+      else
+        self->identical_frames = 0;
+
+      if (self->identical_frames >= EGIS057E_LATCH_FRAMES)
+        {
+          self->identical_frames = 0;
+          if (self->latch_recoveries < 1)
+            {
+              fp_warn ("EGIS057E_SENSOR_LATCHED: %u byte-identical frames; re-running init chain",
+                       EGIS057E_LATCH_FRAMES);
+              self->latch_recoveries++;
+              self->init_step = 0;
+              self->have_previous_frame = FALSE;
+              self->detection_armed = FALSE;
+              self->arm_needs_clear = TRUE;
+              self->arm_clear_frames = 0;
+              self->touch_pending = FALSE;
+              self->touch_settle_frames = 0;
+              self->have_touch_best_frame = FALSE;
+              self->awaiting_release = FALSE;
+              self->awaiting_release_since = 0;
+              self->present_since = 0;
+              self->bg_valid = FALSE;
+              self->bg_warmup = 0;
+              if (self->bg_q8)
+                memset (self->bg_q8, 0, EGIS057E_IMAGE_LEN * sizeof (guint32));
+              fpi_ssm_jump_to_state (transfer->ssm, SM_INIT_SEND);
+              return;
+            }
+          fp_warn ("EGIS057E_SENSOR_LATCHED: sensor still stuck after re-init; failing action");
+          fpi_ssm_mark_failed (transfer->ssm,
+                               fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                 "EGIS057E_SENSOR_LATCHED: sensor keeps returning a stale frame; "
+                                 "power-cycle the reader or run scripts/reset-sensor.sh"));
+          return;
+        }
 
       /* Global presence bookkeeping (drives the stuck-presence watchdog). */
       if (present)
@@ -1462,6 +1505,34 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               if (!self->action_reported)
                 egis057e_report_needed (dev);
             }
+
+          /* Defense in depth: a live permanently-present condition (residue
+           * ghost) cannot be caught by byte-identity; bound the wait instead.
+           * A normal lift (1-3 s) never trips this. */
+          if (self->awaiting_release)
+            {
+              if (self->awaiting_release_since == 0)
+                self->awaiting_release_since = now;
+              if (now - self->awaiting_release_since >
+                  (gint64) EGIS057E_STUCK_PRESENCE_MS * 1000)
+                {
+                  fp_warn ("EGIS057E_RELEASE_STUCK: presence for %d ms after a stage; "
+                           "re-arming and reseeding", EGIS057E_STUCK_PRESENCE_MS);
+                  self->awaiting_release = FALSE;
+                  self->release_frames = 0;
+                  self->awaiting_release_since = 0;
+                  self->present_since = 0;
+                  self->arm_needs_clear = TRUE;
+                  self->arm_clear_frames = 0;
+                  self->bg_valid = FALSE;
+                  self->bg_warmup = 0;
+                  if (self->bg_q8)
+                    memset (self->bg_q8, 0, EGIS057E_IMAGE_LEN * sizeof (guint32));
+                  egis057e_report_present (dev, FALSE);
+                  if (!self->action_reported)
+                    egis057e_report_needed (dev);
+                }
+            }
           goto image_done;
         }
 
@@ -1557,6 +1628,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
               self->have_touch_best_frame = FALSE;
               self->awaiting_release = TRUE;
+              self->awaiting_release_since = now;
               egis057e_watchdog_progress (self);
               goto image_done;
             }
@@ -1567,11 +1639,13 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       {
         if (!self->bg_valid)
           {
-            /* Seed the per-pixel background from genuinely idle live frames only
-             * (mode-consistent by construction; the 0x72 calibration frame is a
-             * different mode/scale and must never seed the baseline). */
-            if (quality.standard_deviation < EGIS057E_FALLBACK_SD &&
-                quality.gradient_rms < EGIS057E_FALLBACK_GRAD)
+            /* Seed from any frame that is not a LIVE structured press (classic
+             * idle frames, or latched/stale frames — both are valid change-
+             * detection references). A live structured frame is excluded so a
+             * finger resting on the sensor at action start cannot poison the
+             * baseline; the arm gate holds until it lifts, then idle frames seed
+             * normally. */
+            if (!(abs_gate && mean_difference > 0.0))
               {
                 for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
                   self->bg_q8[i] += (guint32) transfer->buffer[i] << 8;
@@ -1582,11 +1656,11 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                       self->bg_q8[i] /= EGIS057E_BG_WARMUP_FRAMES;
                     self->bg_valid = TRUE;
                     self->bg_warmup = 0;
-                    fp_info ("EGIS057E_BG_SEED idle");
+                    fp_info ("EGIS057E_BG_SEED (idle or stale reference)");
                   }
               }
-            /* NOTE: do NOT goto image_done here — fall through so the fallback
-             * presence can still trigger a press while the baseline warms up. */
+            /* NOTE: do NOT goto image_done here — fall through so the presence
+             * trigger can still fire while the baseline warms up. */
           }
 
         /* Absent frames refine the background and the idle residual floor. */
@@ -2031,8 +2105,13 @@ egis057e_start_capture (FpDevice *dev)
   self->absent_streak = 0;
   self->idle_absent_streak = 0;
   self->next_poll_ms = EGIS057E_IDLE_POLL_FAST_MS;
-  /* bg_q8/bg_valid/bg_warmup/noise_mad and arm_needs_clear persist across
-   * actions (seeded once in dev_open) so the drift-robust baseline survives. */
+  self->identical_frames = 0;
+  self->latch_recoveries = 0;
+  self->awaiting_release_since = 0;
+  self->arm_needs_clear = TRUE;   /* no settle until the sensor reads clear twice */
+  /* bg_q8/bg_valid/bg_warmup/noise_mad persist across actions (seeded once in
+   * dev_open) so the drift-robust baseline survives; arm_needs_clear is now set
+   * per action and by the latch/release-stuck recovery paths. */
   egis057e_watchdog_progress (self);
 
   self->ssm = fpi_ssm_new (dev, ssm_run_state, SM_STATES_NUM);
