@@ -72,9 +72,14 @@ Sensor` registered.
 
 ## Installing it for GNOME login
 
-On an immutable Fedora (Bluefin / Silverblue) you cannot write to `/usr`, so
-the included script installs the library under `/opt`, points fprintd at it
-with a systemd drop-in, and labels it for SELinux. It is reversible:
+Once it is built, install the resulting libfprint where your system fprintd
+will pick it up, then enroll in Settings -> Users -> Fingerprint Login and lock
+the screen to test.
+
+If you are on an **immutable** image like me (Fedora Bluefin / Silverblue) you
+cannot write to `/usr`, so there are a few extra steps. The included script
+handles them: it installs the library under `/opt`, points fprintd at it with a
+systemd drop-in, and labels it for SELinux. It is reversible:
 
 ```sh
 sudo bash scripts/deploy-fprintd.sh
@@ -98,23 +103,23 @@ If you want the driver's own log while using the normal GNOME login, there is
 ## Honest limitations
 
 The matcher is a reimplementation of a proprietary engine, written for
-interoperability. It is calibrated on a handful of fingers, so expect the
-odd false accept or false reject, and treat the tuning as a work in progress.
-The vendor's own binaries (`EgisTouchFP*.dll`, the `.inf`) are **not**
-included — they come from the Windows Update Catalog and are not
-redistributable; they were used locally only, to study the protocol and
-extract tables. Because the matcher is rebuilt rather than original, this
-driver cannot be upstreamed to libfprint as it stands; a version built on a
-standard open matcher would be the way there. And it has really only been
+interoperability, and it is calibrated on a handful of fingers: expect the odd
+false accept or false reject, and treat the tuning as a work in progress. The
+vendor binaries themselves are not part of this project — they were used
+locally only, to study the protocol. Because the matcher is rebuilt rather than
+original, this driver can't go upstream to libfprint as it stands; one built on
+a standard open matcher would be the way there. And it has really only been
 tried on my one laptop, so expect rough edges elsewhere.
 
 ## Credits
 
 This project was built with the help of an AI coding agent: **OpenCode**
-(https://opencode.ai) driven by the **oh-my-opencode-slim** setup
-(https://github.com/alvinunreal/oh-my-opencode-slim). Much of the protocol work
-started from the earlier EH575 effort (`cosct/libfprint-egis0575`), whose
-coefficients turned out to be shared across the Egis EH5xx family.
+(https://opencode.ai, https://github.com/anomalyco/opencode) driven by the
+**oh-my-opencode-slim** setup
+(https://github.com/alvinunreal/oh-my-opencode-slim). The protocol work leaned
+heavily on the earlier EH575 effort,
+https://github.com/cosct/libfprint-egis0575, whose coefficients turned out to
+be shared across the Egis EH5xx family.
 
 ## License
 

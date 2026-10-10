@@ -75,8 +75,13 @@ Fingerprint Sensor`.
 
 ## Installazione per il login GNOME
 
-Su Fedora immutabile (Bluefin / Silverblue) non si può scrivere in `/usr`, così
-lo script incluso installa la libreria sotto `/opt`, indica a fprintd di usarla
+Una volta compilato, installa la libfprint risultante dove l'fprintd di sistema
+la trova, poi iscrivi l'impronta in Impostazioni -> Utenti -> Impronta digitale e
+blocca lo schermo per provare.
+
+Se sei su un'immagine **immutabile** come me (Fedora Bluefin / Silverblue) non
+puoi scrivere in `/usr`, quindi servono un paio di passaggi in più. Ci pensa lo
+script incluso: installa la libreria sotto `/opt`, indica a fprintd di usarla
 con un drop-in systemd e le mette l'etichetta SELinux. È reversibile:
 
 ```sh
@@ -101,24 +106,23 @@ Se ti serve il log del driver mentre usi il login GNOME normale, c'è
 ## Limiti, onestamente
 
 Il matcher è una reimplementazione di un motore proprietario, scritta per
-interoperabilità. È calibrato su poche dita, quindi aspettati ogni tanto un
-falso accetta o un falso rifiuta, e considera il tuning come un lavoro in
-corso. I binari del produttore (`EgisTouchFP*.dll`, il `.inf`) **non** sono
-inclusi — provengono dal Windows Update Catalog e non sono ridistribuibili;
-sono stati usati solo in locale, per studiare il protocollo ed estrarre le
-tabelle. Poiché il matcher è ricostruito e non originale, questo driver non può
-essere proposto upstream a libfprint così com'è; una versione basata su un
-matcher aperto standard sarebbe la strada. Ed è stato provato davvero solo sul
-mio portatile, quindi aspettati spigoli altrove.
+interoperabilità, ed è calibrato su poche dita: aspettati ogni tanto un falso
+accetta o un falso rifiuta, e considera il tuning come un lavoro in corso. I
+binari del produttore non fanno parte del progetto — sono stati usati solo in
+locale, per studiare il protocollo. Poiché il matcher è ricostruito e non
+originale, questo driver non può essere proposto upstream a libfprint così
+com'è; una versione basata su un matcher aperto standard sarebbe la strada. Ed è
+stato provato davvero solo sul mio portatile, quindi aspettati spigoli altrove.
 
 ## Crediti
 
 Questo progetto è stato realizzato con l'aiuto di un agente di coding IA:
-**OpenCode** (https://opencode.ai) guidato dalla configurazione
-**oh-my-opencode-slim** (https://github.com/alvinunreal/oh-my-opencode-slim).
-Buona parte del lavoro sul protocollo è partita dal precedente sforzo
-sull'EH575 (`cosct/libfprint-egis0575`), i cui coefficienti si sono rivelati
-condivisi in tutta la famiglia Egis EH5xx.
+**OpenCode** (https://opencode.ai, https://github.com/anomalyco/opencode)
+guidato dalla configurazione **oh-my-opencode-slim**
+(https://github.com/alvinunreal/oh-my-opencode-slim). Il lavoro sul protocollo
+si è appoggiato molto al precedente sforzo sull'EH575,
+https://github.com/cosct/libfprint-egis0575, i cui coefficienti si sono
+rivelati condivisi in tutta la famiglia Egis EH5xx.
 
 ## Licenza
 
