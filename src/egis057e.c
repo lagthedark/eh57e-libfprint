@@ -1376,6 +1376,25 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
           return;
         }
 
+      /* Seed the per-pixel background from the first live frames of the action
+       * (the sensor is idle at action start) BEFORE the arm gate can block, so
+       * presence can be decided by coverage instead of the absolute gate, which
+       * is trivially satisfied by this sensor's idle frames. No-ops once valid. */
+      if (!self->bg_valid)
+        {
+          for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
+            self->bg_q8[i] += (guint32) transfer->buffer[i] << 8;
+          self->bg_warmup++;
+          if (self->bg_warmup >= EGIS057E_BG_WARMUP_FRAMES)
+            {
+              for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
+                self->bg_q8[i] /= EGIS057E_BG_WARMUP_FRAMES;
+              self->bg_valid = TRUE;
+              self->bg_warmup = 0;
+              fp_info ("EGIS057E_BG_SEED (early)");
+            }
+        }
+
       /* Global presence bookkeeping (drives the stuck-presence watchdog). */
       if (present)
         {
