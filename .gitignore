@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+build-src/
+*.o
+*.so
+*.so.*
+
+# Runtime/test data (biometric captures, logs, templates) — never commit
+captures/
+hwtest/
+*.pgm
+*.variant
+*.log
+
+# Vendor binaries — NOT redistributable (Windows Update Catalog)
+vendor/
+*.dll
+*.inf
+*.cat
