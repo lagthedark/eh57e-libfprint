@@ -538,6 +538,29 @@ calibration_image_cb (FpiUsbTransfer *transfer, FpDevice *dev,
    * frame per activation. Optional debug dump for the capture tool. */
   memcpy (self->calibration_frame, transfer->buffer, EGIS057E_IMAGE_LEN);
   self->have_calibration_frame = TRUE;
+
+  /* Seed the per-pixel background from this fresh EMPTY-sensor frame so the
+   * presence trigger is coverage-based from the very FIRST live frame.
+   * Without this every action is blind until EGIS057E_BG_WARMUP_FRAMES idle
+   * frames accrue (dev_open wipes the baseline), and a press made right after
+   * the prompt lands in that blind window and is silently ignored -- the user
+   * then has to lift and press again. Runs once per action (bg_valid is reset
+   * in dev_open); the absent-frame EMA then polishes it. */
+  if (self->bg_q8 && !self->bg_valid)
+    {
+      guint64 sum = 0;
+
+      for (guint i = 0; i < EGIS057E_IMAGE_LEN; i++)
+        {
+          self->bg_q8[i] = (guint32) transfer->buffer[i] << 8;
+          sum += transfer->buffer[i];
+        }
+      self->bg_warmup = EGIS057E_BG_WARMUP_FRAMES;
+      self->bg_valid = TRUE;
+      fp_info ("EGIS057E_BG_SEED (calibration): mean %.1f",
+               (double) sum / EGIS057E_IMAGE_LEN);
+    }
+
   {
     const gchar *dump_path = g_getenv ("EGIS057E_BG_DUMP_PATH");
 
