@@ -1236,17 +1236,6 @@ egis057e_handle_verify (FpDeviceEgis057e *self, FpDevice *dev,
         egis057e_begin_lift_wait (self, dev);
         return FALSE;
       }
-
-    /* Gray zone [reject, threshold): this press was read but did not match.
-     * The core allows exactly ONE verify report per action, so a hint cannot
-     * be sent mid-action while still collecting: end the action with a retry
-     * instead — fprintd shows the hint and auto-restarts, gated on a clear
-     * frame by arm_needs_clear. */
-    fp_info ("Verify probe %u gray zone (best %d in [%d, threshold)); retry exit",
-             self->verify_probe_count, best, reject);
-    egis057e_verify_retry_exit (self, dev, FP_DEVICE_RETRY_REMOVE_FINGER,
-      "Finger not recognized; remove it and try again");
-    return TRUE;
   }
 
   if (self->verify_probe_count >= egis057e_verify_probe_target ())
