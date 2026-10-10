@@ -163,7 +163,7 @@ struct _FpDeviceEgis057e
   guint       weak_touch_frames; /* consecutive weak-touch frames (WAITING) */
   guint       weak_gap_frames;  /* consecutive clearly-no-touch frames      */
   gint64      weak_hint_deadline; /* next allowed weak-touch hint (cooldown) */
-  gboolean    weak_hint_alt;      /* alternate retry code so GNOME re-shows   */
+  gboolean    hint_alt;           /* alternate retry code so GNOME re-shows   */
   guint8      calibration_sample;
   gboolean    have_calibration_sample;
 
@@ -339,6 +339,20 @@ egis057e_report_needed (FpDevice *dev)
   /* Action start: waiting for a finger; clear any stale PRESENT. */
   fpi_device_report_finger_status_changes (dev,
     FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_PRESENT);
+}
+
+/* GNOME latches identical retry text (a repeated same-code hint is visually
+ * invisible), so alternate the retry code across hint emissions to keep
+ * consecutive messages distinct. Never reset: it must alternate across
+ * attempts. */
+static FpDeviceRetry
+egis057e_next_hint_code (FpDeviceEgis057e *self)
+{
+  FpDeviceRetry code = self->hint_alt ? FP_DEVICE_RETRY_GENERAL
+                                      : FP_DEVICE_RETRY_CENTER_FINGER;
+
+  self->hint_alt = !self->hint_alt;
+  return code;
 }
 
 /* -------------------------------------------------------------------------
@@ -1079,7 +1093,7 @@ egis057e_handle_enroll (FpDeviceEgis057e *self, FpDevice *dev,
               quality.standard_deviation, quality.gradient_rms,
               quality.intensity_range);
       fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
-                                  fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                                  fpi_device_retry_new_msg (egis057e_next_hint_code (self),
                                                             "Fingerprint image has insufficient ridge detail; reposition and retry"));
       return FALSE;
     }
@@ -1600,9 +1614,10 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
                   !self->retry_reported)
                 {
-                  fp_info ("EGIS057E_SETTLE_ABORT hint (lifted before a usable frame)");
+                  fp_info ("EGIS057E_SETTLE_ABORT hint (lifted before a usable frame, code %s)",
+                           self->hint_alt ? "general" : "centered");
                   fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
-                    fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
+                    fpi_device_retry_new_msg (egis057e_next_hint_code (self),
                       "Finger lifted too early; keep it on the sensor until the stage completes"));
                 }
               self->retry_reported = FALSE;
@@ -1646,7 +1661,7 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                     {
                       self->retry_reported = TRUE;
                       fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
-                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
+                        fpi_device_retry_new_msg (egis057e_next_hint_code (self),
                           "Weak or off-center fingerprint; reposition your finger"));
                     }
                   /* The stuck-presence watchdog bounds a weak press. */
@@ -1764,21 +1779,12 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                   {
                     self->weak_hint_deadline = now +
                       (gint64) EGIS057E_TOUCH_HINT_COOLDOWN_MS * 1000;
-                    /* Alternate the retry code: GNOME 50 suppresses a repeat of
-                     * the SAME status string, so alternating centered<->general
-                     * keeps consecutive hints distinct (and therefore shown). */
                     fp_info ("EGIS057E_WEAK_TOUCH hint (cov %.1f%% mad %.1f, code %s)",
                              presence.coverage, presence.mad,
-                             self->weak_hint_alt ? "general" : "centered");
-                    if (self->weak_hint_alt)
-                      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
-                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_GENERAL,
-                          "Touch too light: press flatter so more of the finger touches the sensor"));
-                    else
-                      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
-                        fpi_device_retry_new_msg (FP_DEVICE_RETRY_CENTER_FINGER,
-                          "Touch too light: press flatter so more of the finger touches the sensor"));
-                    self->weak_hint_alt = !self->weak_hint_alt;
+                             self->hint_alt ? "general" : "centered");
+                    fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                      fpi_device_retry_new_msg (egis057e_next_hint_code (self),
+                        "Touch too light: press flatter so more of the finger touches the sensor"));
                   }
               }
             else
