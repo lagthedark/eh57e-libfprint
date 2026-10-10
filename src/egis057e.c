@@ -1046,6 +1046,29 @@ egis057e_begin_lift_wait (FpDeviceEgis057e *self, FpDevice *dev)
   fp_info ("EGIS057E_VERIFY_WAIT_LIFT");
 }
 
+/* VERIFY: a press that yields no usable frame would otherwise stay silent
+ * until the deadline. Report the standard no-match verdict NOW (the same
+ * proven path as a genuine mismatch) and complete after the finger lifts, so
+ * the lock screen promptly shows "failed to match" and re-prompts. Unlike a
+ * retry-exit this does NOT auto-restart the action, so it cannot wedge. */
+static void
+egis057e_verify_fail_early (FpDeviceEgis057e *self, FpDevice *dev)
+{
+  if (self->verify_verdict_done)
+    return;
+
+  self->verify_verdict_done = TRUE;
+  fp_info ("EGIS057E_VERIFY_FAIL early (no usable press); verdict NO MATCH");
+  fpi_device_verify_report (dev, FPI_MATCH_FAIL, NULL, NULL);
+
+  self->verify_deadline = 0;
+  self->verify_waiting_lift = TRUE;
+  self->verify_lift_frames = 0;
+  self->verify_lift_deadline = g_get_monotonic_time () +
+                               egis057e_verify_lift_timeout_ms () * 1000;
+  fp_info ("EGIS057E_VERIFY_WAIT_LIFT");
+}
+
 static guint
 egis057e_enroll_sim_threshold (void)
 {
@@ -1656,6 +1679,13 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
                    * When the window is exhausted, give ENROLL one-shot on-screen
                    * feedback; the retry is now emitted during the settle while
                    * finger-present is reported (from SETTLE_START). */
+                  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY &&
+                      self->touch_settle_frames >= window)
+                    {
+                      fp_info ("EGIS057E_VERIFY_FAIL early (weak press, no usable frame)");
+                      egis057e_verify_fail_early (self, dev);
+                      goto image_done;
+                    }
                   if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL &&
                       self->touch_settle_frames >= window &&
                       !self->retry_reported)
