@@ -50,11 +50,15 @@
 #define EGIS057E_FALLBACK_SD         8.0   /* absolute presence fallback while unseeded */
 #define EGIS057E_FALLBACK_GRAD      12.0
 #define EGIS057E_PRESENCE_COVERAGE   12.0  /* % pixels beyond T => PRESENT */
-#define EGIS057E_ABSENCE_COVERAGE     6.0  /* % => ABSENT + baseline update ok */
+#define EGIS057E_ABSENCE_COVERAGE    10.0  /* % => ABSENT + baseline update ok.
+                                            * This sensor's idle residue sits at
+                                            * 7-9% cov, so 6% never marked the
+                                            * finger lifted (RELEASE_STUCK). */
 #define EGIS057E_BG_EMA_RATE         0.25  /* per absent frame, per pixel */
 #define EGIS057E_BG_WARMUP_FRAMES    4
 #define EGIS057E_BG_SEED_MAD_MAX     15.0
 #define EGIS057E_STUCK_PRESENCE_MS   10000
+#define EGIS057E_RELEASE_STUCK_MS     4000  /* bound the post-stage lift wait */
 #define EGIS057E_LATCH_FRAMES   3   /* consecutive byte-identical polls => latched */
 #define EGIS057E_IDLE_POLL_FAST_MS    250
 #define EGIS057E_IDLE_POLL_MID_MS     500
@@ -1544,10 +1548,10 @@ image_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
               if (self->awaiting_release_since == 0)
                 self->awaiting_release_since = now;
               if (now - self->awaiting_release_since >
-                  (gint64) EGIS057E_STUCK_PRESENCE_MS * 1000)
+                  (gint64) EGIS057E_RELEASE_STUCK_MS * 1000)
                 {
                   fp_warn ("EGIS057E_RELEASE_STUCK: presence for %d ms after a stage; "
-                           "re-arming and reseeding", EGIS057E_STUCK_PRESENCE_MS);
+                           "re-arming and reseeding", EGIS057E_RELEASE_STUCK_MS);
                   self->awaiting_release = FALSE;
                   self->release_frames = 0;
                   self->awaiting_release_since = 0;
